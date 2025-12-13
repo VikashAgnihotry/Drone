@@ -1,132 +1,187 @@
 #include <Arduino.h>
 #include "remotexy_module.h"
-#include "battery.h"   // Include your header file
+#include "battery.h"
 #include "mpu.h"
 #include "bmp280_module.h"
 #include "pid.h"
 #include "mixer.h"
+#include "esc_driver.h"
+#include "arm_failsafe.h"
 
+// ================= ESC PINS =================
+#define ESC_FL 26
+#define ESC_FR 14
+#define ESC_RR 25
+#define ESC_RL 27
 
+// ================= OBJECTS =================
 MixerQuadX mixer;
 
-
-// --- PID Instances (tune later) ---
-PID pidRoll(4.0, 0.01, 1.5);   
+// PID controllers
+PID pidRoll(4.0, 0.01, 1.5);
 PID pidPitch(4.0, 0.01, 1.5);
 PID pidYaw(2.0, 0.005, 0.0);
+PID pidAltitude(1.5, 0.3, 0.8);
 
-// Altitude PID
-PID pidAltitude(1.5, 0.3, 0.8);  
+// Altitude state
+float altFiltered = 0.0f;
+float targetAltitude = 0.0f;
+bool altitudeInitialized = false;
 
-// For smoothing noisy barometer altitude
-float altFiltered = 0;
-float targetAltitude = 0;
-bool altHold = false;
+// ================= CONSTANTS =================
+const float HOVER_THROTTLE = 0.10f;      // tune for your drone
+const float MAX_CLIMB_RATE = 1.0f;       // m/s
+const float THROTTLE_DEADBAND = 0.05f;   // stick noise
 
+// ================= ARM CALLBACKS =================
+void onArm() {
+  escArm();
+  Serial.println(">>> ESC ARMED <<<");
+}
 
+void onDisarm() {
+  escDisarm();
+  pidAltitude.reset();   // safety
+  Serial.println(">>> ESC DISARMED <<<");
+}
+
+// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
 
-//--------------remote setup------------
+  // ---------- RemoteXY ----------
   RemoteXYModule::begin();
   Serial.println("RemoteXY started");
-  
 
-//-----------mpu setting up-----------
-  mpuBegin();
-  delay(500);
-  mpuBegin(true, 250); // auto-calibrate gyro on begin with 250 samples
+  // ---------- MPU ----------
+  mpuBegin(true, 250);
   mpuCalibrateGyro();
-  Serial.println("MPU ready. Use mpuCalibrateGyro() later if needed.");
-  delay(2000);
-  Serial.println("Battery voltage measurement test");
+  Serial.println("MPU ready");
 
-//-----------------bmp setup---------------
-
-   if (!bmp280ModuleBegin()) {
+  // ---------- BMP ----------
+  if (!bmp280ModuleBegin()) {
     Serial.println("BMP280 not detected!");
     while (1);
   }
 
-  // ================= PID CONFIGURATION =================
-
-  // Roll / Pitch / Yaw limits
+  // ---------- PID CONFIG ----------
   pidRoll.setLimits(-0.3f, 0.3f);
   pidPitch.setLimits(-0.3f, 0.3f);
   pidYaw.setLimits(-0.2f, 0.2f);
 
-  // Altitude PID (THIS is what you asked about)
-  pidAltitude.setDeadband(0.05f);   // ignore ±5 cm altitude noise
+  pidAltitude.setDeadband(0.05f);
   pidAltitude.setLimits(-0.3f, 0.3f);
 
-  Serial.println("PID configured");
-//-------------------mixer range------------------
+  // ---------- Mixer ----------
   mixer.setOutputRange(0.0f, 1.0f);
 
-  delay(1000);
+  // ---------- ESC ----------
+  escBegin(ESC_FL, ESC_FR, ESC_RR, ESC_RL);
+  Serial.println("ESC initialized (DISARMED)");
 
+  delay(1000);
 }
 
+// ================= LOOP =================
 void loop() {
-  //---------remote controller-------------
-  RemoteXYModule::loop();          
-   static unsigned long t = 0;
-  if (millis() - t > 200) {
-    t = millis();
-    auto c = RemoteXYModule::getControls();
 
-    Serial.print("P:"); Serial.print(c.pitch);
-    Serial.print(" R:"); Serial.print(c.roll);
-    Serial.print(" T:"); Serial.print(c.throttle);
-    Serial.print(" Y:"); Serial.print(c.yaw);
-    Serial.print(" Conn:"); Serial.print(c.connected);
+  // ---------- RemoteXY ----------
+  RemoteXYModule::loop();
+  RemoteXYModule::Controls c = RemoteXYModule::getControls();
 
+  // ---------- ARM / FAILSAFE MODULE ----------
+  armFailsafeUpdate(
+    c.throttle,
+    RemoteXYModule::isConnected(),
+    onArm,
+    onDisarm
+  );
 
-    float rollSet     = c.roll    * 0.3f;    // scale input (-100..100)
-    float pitchSet    = c.pitch   * 0.3f;
-    float yawSet      = c.yaw     * 0.3f;    // yaw rate
-    float throttleSet = (c.throttle + 100) / 200.0f;  // normalize 0..1
+  // ---------- HARD FAILSAFE ----------
+  if (!RemoteXYModule::isConnected() || !isArmed()) {
+    escEmergencyStop();
+    return;
+  }
 
-  } //
-//------------------remote controller-------------------
-
-//--------------------------------battery setup-----------------------------------------------------------
+  // ---------- Battery ----------
   float voltage = getBatteryVoltage();
-  Serial.print(" Battery Voltage: ");
-  Serial.print(voltage);
-  Serial.print(" V");
   RemoteXYModule::setBattery(voltage);
 
-//--------------------------------battery setup-------------------------------
-
-//--------------------------------MPU setup-------------------------------
+  // ---------- MPU ----------
   Orientation o = getOrientation();
 
-  Serial.print(" Roll: ");  Serial.print(o.roll);
-  Serial.print("  Pitch: "); Serial.print(o.pitch);
-  Serial.print("  Yaw: "); Serial.print(o.yaw);
-
-//--------------------------------MPU setup-------------------------------
-
-//--------------------------------BMP setup-------------------------------
+  // ---------- BMP / ALTITUDE ----------
   BMPData d = getBMP();
 
-  Serial.print(" T: ");
-  Serial.print(d.temperature);
-  Serial.print(" C  P: ");
-  Serial.print(d.pressure);
-  Serial.print(" Pa  Alt: ");
-  Serial.println(d.altitude);
-//--------------------------------BMP setup-------------------------------
-//---- --- Altitude Filtering ---
-  static bool firstAlt = true;
-  if (firstAlt) {
+  if (!altitudeInitialized) {
     altFiltered = d.altitude;
-    firstAlt = false;
+    targetAltitude = d.altitude;
+    altitudeInitialized = true;
   }
-  altFiltered = altitudeLPF(d.altitude, altFiltered, 0.90); // from pid.h
 
-//
-  delay(100);
-  //delay(1000); // measure every 1 sec
+  altFiltered = altitudeLPF(d.altitude, altFiltered, 0.90f);
+
+  // ---------- ALTITUDE HOLD ----------
+  static unsigned long lastAltTime = millis();
+  unsigned long now = millis();
+  float dt = (now - lastAltTime) / 1000.0f;
+  if (dt < 0.001f) dt = 0.001f;
+  lastAltTime = now;
+
+  float throttleCmd = c.throttle / 100.0f;
+  if (fabs(throttleCmd) < THROTTLE_DEADBAND) throttleCmd = 0.0f;
+
+  targetAltitude += throttleCmd * MAX_CLIMB_RATE * dt;
+
+  // Clamp target altitude
+  targetAltitude = constrain(
+    targetAltitude,
+    altFiltered - 2.0f,
+    altFiltered + 2.0f
+  );
+
+  float throttle =
+    HOVER_THROTTLE +
+    pidAltitude.compute(targetAltitude, altFiltered);
+
+  throttle = constrain(throttle, 0.0f, 1.0f);
+
+  // ---------- ATTITUDE PID ----------
+  float rollSet  = c.roll  * 0.3f;
+  float pitchSet = c.pitch * 0.3f;
+  float yawSet   = c.yaw   * 0.3f;
+
+  float rollOut  = pidRoll.compute(rollSet, o.roll);
+  float pitchOut = pidPitch.compute(pitchSet, o.pitch);
+  float yawOut   = pidYaw.compute(yawSet, 0.0f); // yaw rate
+
+  // ---------- MIXER ----------
+  MotorOutputs motors = mixer.mix(
+    throttle,
+    rollOut,
+    pitchOut,
+    yawOut
+  );
+
+  // ---------- ESC OUTPUT ----------
+  escWriteMotors(
+    motors.m[0],
+    motors.m[1],
+    motors.m[2],
+    motors.m[3]
+  );
+
+  // ---------- DEBUG ----------
+  static unsigned long dbgT = 0;
+  if (millis() - dbgT > 200) {
+    dbgT = millis();
+    Serial.print("ALT:"); Serial.print(altFiltered, 2);
+    Serial.print(" TGT:"); Serial.print(targetAltitude, 2);
+    Serial.print(" THR:"); Serial.print(throttle, 2);
+    Serial.print(" M:");
+    Serial.print(motors.m[0], 2); Serial.print(",");
+    Serial.print(motors.m[1], 2); Serial.print(",");
+    Serial.print(motors.m[2], 2); Serial.print(",");
+    Serial.println(motors.m[3], 2);
+  }
 }

@@ -11,7 +11,7 @@
 // ================= ESC PINS =================
 #define ESC_FL 26
 #define ESC_FR 14
-#define ESC_RR 25
+#define ESC_RR 33
 #define ESC_RL 27
 
 // ================= OBJECTS =================
